@@ -90,8 +90,23 @@ public class Server {
                 String fileName = dataInputStream.readUTF();
                 System.out.println("Receiving file: " + fileName);
 
-                // Receive file
-                String savedPath = receiveFile(dataInputStream, fileName, outputDir);
+                // Check for partial file and determine resume offset
+                String outputPath = outputDir + File.separator + new File(fileName).getName();
+                String partialPath = outputPath + ".partial";
+                File partialFile = new File(partialPath);
+                long resumeOffset = 0;
+
+                if (partialFile.exists() && partialFile.isFile()) {
+                    resumeOffset = partialFile.length();
+                    System.out.println("Found partial file, resuming from: " + formatFileSize(resumeOffset));
+                }
+
+                // Send resume offset to client
+                dataOutputStream.writeLong(resumeOffset);
+                dataOutputStream.flush();
+
+                // Receive file (resume or new)
+                String savedPath = receiveFile(dataInputStream, dataOutputStream, fileName, outputDir, resumeOffset);
 
                 // Receive MD5 checksum from client
                 String clientChecksum = dataInputStream.readUTF();
@@ -122,33 +137,50 @@ public class Server {
             }
         }
 
-        private String receiveFile(DataInputStream dataInputStream, String fileName, String outputDir)
-                throws Exception {
-            long fileSize = dataInputStream.readLong();
-            System.out.println("File size: " + formatFileSize(fileSize));
+        private String receiveFile(DataInputStream dataInputStream, DataOutputStream dataOutputStream,
+                String fileName, String outputDir, long resumeOffset) throws Exception {
+            long totalFileSize = dataInputStream.readLong();
+            System.out.println("Total file size: " + formatFileSize(totalFileSize));
 
             String outputPath = outputDir + File.separator + new File(fileName).getName();
-            File outputFile = new File(outputPath);
+            String partialPath = outputPath + ".partial";
+            File partialFile = new File(partialPath);
+            File finalFile = new File(outputPath);
 
-            // Handle duplicate filenames
-            int counter = 1;
-            while (outputFile.exists()) {
-                String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
-                String extension = fileName.substring(fileName.lastIndexOf('.'));
-                outputPath = outputDir + File.separator + baseName + "_" + counter + extension;
-                outputFile = new File(outputPath);
-                counter++;
+            // Check if resuming
+            boolean isResuming = resumeOffset > 0;
+            long bytesToReceive = totalFileSize - resumeOffset;
+
+            if (isResuming) {
+                System.out.println("Resuming transfer. Remaining: " + formatFileSize(bytesToReceive));
+                // Validate that partial file size matches resume offset
+                if (partialFile.length() != resumeOffset) {
+                    System.err.println("Warning: Partial file size mismatch. Restarting from beginning.");
+                    partialFile.delete();
+                    resumeOffset = 0;
+                    bytesToReceive = totalFileSize;
+                    dataOutputStream.writeUTF("RESTART");
+                    dataOutputStream.flush();
+                } else {
+                    dataOutputStream.writeUTF("CONTINUE");
+                    dataOutputStream.flush();
+                }
+            } else {
+                System.out.println("Starting new transfer");
+                dataOutputStream.writeUTF("CONTINUE");
+                dataOutputStream.flush();
             }
 
-            long totalBytesRead = 0;
-            int lastProgress = 0;
+            long totalBytesRead = resumeOffset;
+            int lastProgress = (int) ((resumeOffset * 100) / totalFileSize);
 
-            try (FileOutputStream fileOutputStream = new FileOutputStream(outputFile);
+            // Append to partial file or create new
+            try (FileOutputStream fileOutputStream = new FileOutputStream(partialFile, isResuming);
                     BufferedOutputStream bufferedOutputStream = new BufferedOutputStream(fileOutputStream)) {
 
                 byte[] buffer = new byte[BUFFER_SIZE];
                 int bytes;
-                long remaining = fileSize;
+                long remaining = bytesToReceive;
 
                 while (remaining > 0 && (bytes = dataInputStream.read(buffer, 0,
                         (int) Math.min(buffer.length, remaining))) != -1) {
@@ -157,17 +189,39 @@ public class Server {
                     remaining -= bytes;
 
                     // Display progress
-                    int progress = (int) ((totalBytesRead * 100) / fileSize);
+                    int progress = (int) ((totalBytesRead * 100) / totalFileSize);
                     if (progress != lastProgress && progress % 10 == 0) {
                         System.out.println("Progress: " + progress + "% (" +
                                 formatFileSize(totalBytesRead) + " / " +
-                                formatFileSize(fileSize) + ")");
+                                formatFileSize(totalFileSize) + ")");
                         lastProgress = progress;
                     }
                 }
             }
 
-            System.out.println("✓ File saved: " + outputFile.getAbsolutePath());
+            // Transfer complete - rename partial file to final name
+            if (totalBytesRead == totalFileSize) {
+                // Handle duplicate final filenames
+                int counter = 1;
+                while (finalFile.exists()) {
+                    String baseName = fileName.substring(0, fileName.lastIndexOf('.'));
+                    String extension = fileName.substring(fileName.lastIndexOf('.'));
+                    outputPath = outputDir + File.separator + baseName + "_" + counter + extension;
+                    finalFile = new File(outputPath);
+                    counter++;
+                }
+
+                if (partialFile.renameTo(finalFile)) {
+                    System.out.println("✓ File saved: " + finalFile.getAbsolutePath());
+                } else {
+                    System.err.println("Warning: Could not rename partial file. Keeping as: " + partialPath);
+                    return partialPath;
+                }
+            } else {
+                System.out.println("⚠ Transfer incomplete. Partial file saved: " + partialPath);
+                return partialPath;
+            }
+
             return outputPath;
         }
 

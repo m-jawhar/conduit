@@ -3,6 +3,7 @@ import java.io.DataInputStream;
 import java.io.DataOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
+import java.io.IOException;
 import java.net.Socket;
 import java.security.DigestInputStream;
 import java.security.MessageDigest;
@@ -59,18 +60,40 @@ public class Client {
                 DataOutputStream dataOutputStream = new DataOutputStream(socket.getOutputStream())) {
 
             System.out.println("✓ Connected to server");
-            System.out.println("Sending file...");
 
             // Send filename
             dataOutputStream.writeUTF(file.getName());
+            dataOutputStream.flush();
+
+            // Receive resume offset from server
+            long resumeOffset = dataInputStream.readLong();
+
+            if (resumeOffset > 0) {
+                System.out.println("⚠ Resuming previous transfer from: " + formatFileSize(resumeOffset));
+                System.out.println("Already transferred: " + formatFileSize(resumeOffset) + " / " +
+                        formatFileSize(file.length()));
+            } else {
+                System.out.println("Sending file...");
+            }
+
+            // Send total file size
+            dataOutputStream.writeLong(file.length());
+            dataOutputStream.flush();
+
+            // Wait for server confirmation to continue or restart
+            String serverResponse = dataInputStream.readUTF();
+            if ("RESTART".equals(serverResponse)) {
+                System.out.println("Server requested restart. Starting from beginning...");
+                resumeOffset = 0;
+            }
 
             // Calculate MD5 before sending
             System.out.println("Calculating MD5 checksum...");
             String md5Checksum = calculateMD5(filePath);
             System.out.println("MD5: " + md5Checksum);
 
-            // Send file
-            sendFile(dataOutputStream, file);
+            // Send file (with resume offset)
+            sendFile(dataOutputStream, file, resumeOffset);
 
             // Send MD5 checksum
             dataOutputStream.writeUTF(md5Checksum);
@@ -94,23 +117,36 @@ public class Client {
         }
     }
 
-    private static void sendFile(DataOutputStream dataOutputStream, File file)
+    private static void sendFile(DataOutputStream dataOutputStream, File file, long resumeOffset)
             throws Exception {
         long fileSize = file.length();
-        dataOutputStream.writeLong(fileSize);
-
-        long totalBytesSent = 0;
-        int lastProgress = 0;
+        long totalBytesSent = resumeOffset;
+        int lastProgress = (int) ((resumeOffset * 100) / fileSize);
 
         try (FileInputStream fileInputStream = new FileInputStream(file);
                 BufferedInputStream bufferedInputStream = new BufferedInputStream(fileInputStream)) {
 
+            // Skip to resume offset
+            if (resumeOffset > 0) {
+                long skipped = bufferedInputStream.skip(resumeOffset);
+                if (skipped != resumeOffset) {
+                    throw new IOException("Failed to skip to resume offset. Expected: " +
+                            resumeOffset + ", Actual: " + skipped);
+                }
+                System.out.println("Skipped to offset: " + formatFileSize(resumeOffset));
+            }
+
             byte[] buffer = new byte[BUFFER_SIZE];
             int bytes;
+            long remaining = fileSize - resumeOffset;
 
-            while ((bytes = bufferedInputStream.read(buffer)) != -1) {
+            System.out.println("Sending remaining: " + formatFileSize(remaining));
+
+            while (remaining > 0 && (bytes = bufferedInputStream.read(buffer, 0,
+                    (int) Math.min(buffer.length, remaining))) != -1) {
                 dataOutputStream.write(buffer, 0, bytes);
                 totalBytesSent += bytes;
+                remaining -= bytes;
 
                 // Display progress
                 int progress = (int) ((totalBytesSent * 100) / fileSize);
