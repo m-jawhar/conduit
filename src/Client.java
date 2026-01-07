@@ -6,7 +6,13 @@ import java.io.FileInputStream;
 import java.io.IOException;
 import java.net.Socket;
 import java.security.DigestInputStream;
+import java.security.KeyStore;
 import java.security.MessageDigest;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.SSLSocketFactory;
+import javax.net.ssl.TrustManagerFactory;
 
 public class Client {
 
@@ -16,23 +22,45 @@ public class Client {
 
     public static void main(String[] args) {
         if (args.length < 1) {
-            System.out.println("Usage: java Client <file_path> [host] [port]");
+            System.out.println(
+                    "Usage: java Client <file_path> [host] [port] [--ssl truststore_path truststore_password]");
             System.out.println("  file_path: Path to the file to transfer");
             System.out.println("  host: Server hostname or IP (default: localhost)");
             System.out.println("  port: Server port (default: 900)");
+            System.out.println("  --ssl: Enable SSL/TLS encryption");
+            System.out.println("    truststore_path: Path to truststore file");
+            System.out.println("    truststore_password: Truststore password");
             System.exit(1);
         }
 
         String filePath = args[0];
-        String host = args.length > 1 ? args[1] : DEFAULT_HOST;
+        String host = DEFAULT_HOST;
         int port = DEFAULT_PORT;
+        boolean useSSL = false;
+        String truststorePath = null;
+        String truststorePassword = null;
 
-        if (args.length > 2) {
-            try {
-                port = Integer.parseInt(args[2]);
-            } catch (NumberFormatException e) {
-                System.err.println("Invalid port number. Using default: " + DEFAULT_PORT);
-                port = DEFAULT_PORT;
+        // Parse optional arguments
+        int i = 1;
+        while (i < args.length) {
+            if ("--ssl".equals(args[i]) && i + 2 < args.length) {
+                useSSL = true;
+                truststorePath = args[i + 1];
+                truststorePassword = args[i + 2];
+                i += 3;
+            } else if (i == 1) {
+                host = args[i];
+                i++;
+            } else if (i == 2) {
+                try {
+                    port = Integer.parseInt(args[i]);
+                } catch (NumberFormatException e) {
+                    System.err.println("Invalid port number. Using default: " + DEFAULT_PORT);
+                    port = DEFAULT_PORT;
+                }
+                i++;
+            } else {
+                i++;
             }
         }
 
@@ -52,66 +80,82 @@ public class Client {
         }
 
         System.out.println("Connecting to " + host + ":" + port);
+        System.out.println("SSL/TLS: " + (useSSL ? "Enabled" : "Disabled"));
         System.out.println("File: " + file.getAbsolutePath());
         System.out.println("Size: " + formatFileSize(file.length()));
 
-        try (Socket socket = new Socket(host, port);
-                DataInputStream dataInputStream = new DataInputStream(socket.getInputStream());
-                DataOutputStream dataOutputStream = new DataOutputStream(socket.getOutputStream())) {
+        try {
+            Socket socket;
 
-            System.out.println("✓ Connected to server");
-
-            // Send filename
-            dataOutputStream.writeUTF(file.getName());
-            dataOutputStream.flush();
-
-            // Receive resume offset from server
-            long resumeOffset = dataInputStream.readLong();
-
-            if (resumeOffset > 0) {
-                System.out.println("⚠ Resuming previous transfer from: " + formatFileSize(resumeOffset));
-                System.out.println("Already transferred: " + formatFileSize(resumeOffset) + " / " +
-                        formatFileSize(file.length()));
+            if (useSSL) {
+                socket = createSSLSocket(host, port, truststorePath, truststorePassword);
+                System.out.println("\u2713 Connected to server (SSL/TLS encrypted)");
             } else {
-                System.out.println("Sending file...");
+                socket = new Socket(host, port);
+                System.out.println("\u2713 Connected to server (plain-text)");
+                System.out.println("\u26a0 WARNING: Connection is not encrypted!");
             }
 
-            // Send total file size
-            dataOutputStream.writeLong(file.length());
-            dataOutputStream.flush();
+            try (socket;
+                    DataInputStream dataInputStream = new DataInputStream(socket.getInputStream());
+                    DataOutputStream dataOutputStream = new DataOutputStream(socket.getOutputStream())) {
 
-            // Wait for server confirmation to continue or restart
-            String serverResponse = dataInputStream.readUTF();
-            if ("RESTART".equals(serverResponse)) {
-                System.out.println("Server requested restart. Starting from beginning...");
-                resumeOffset = 0;
-            }
+                // Send filename
+                dataOutputStream.writeUTF(file.getName());
+                dataOutputStream.flush();
 
-            // Calculate MD5 before sending
-            System.out.println("Calculating MD5 checksum...");
-            String md5Checksum = calculateMD5(filePath);
-            System.out.println("MD5: " + md5Checksum);
+                // Receive resume offset from server
+                long resumeOffset = dataInputStream.readLong();
 
-            // Send file (with resume offset)
-            sendFile(dataOutputStream, file, resumeOffset);
+                if (resumeOffset > 0) {
+                    System.out.println("⚠ Resuming previous transfer from: " + formatFileSize(resumeOffset));
+                    System.out.println("Already transferred: " + formatFileSize(resumeOffset) + " / " +
+                            formatFileSize(file.length()));
+                } else {
+                    System.out.println("Sending file...");
+                }
 
-            // Send MD5 checksum
-            dataOutputStream.writeUTF(md5Checksum);
-            dataOutputStream.flush();
+                // Send total file size
+                dataOutputStream.writeLong(file.length());
+                dataOutputStream.flush();
 
-            // Wait for server confirmation
-            String response = dataInputStream.readUTF();
-            if ("SUCCESS".equals(response)) {
-                System.out.println("\n✓ File transferred successfully and verified!");
-            } else if ("CHECKSUM_MISMATCH".equals(response)) {
-                System.err.println("\n✗ Error: File corruption detected on server!");
+                // Wait for server confirmation to continue or restart
+                String serverResponse = dataInputStream.readUTF();
+                if ("RESTART".equals(serverResponse)) {
+                    System.out.println("Server requested restart. Starting from beginning...");
+                    resumeOffset = 0;
+                }
+
+                // Calculate MD5 before sending
+                System.out.println("Calculating MD5 checksum...");
+                String md5Checksum = calculateMD5(filePath);
+                System.out.println("MD5: " + md5Checksum);
+
+                // Send file (with resume offset)
+                sendFile(dataOutputStream, file, resumeOffset);
+
+                // Send MD5 checksum
+                dataOutputStream.writeUTF(md5Checksum);
+                dataOutputStream.flush();
+
+                // Wait for server confirmation
+                String response = dataInputStream.readUTF();
+                if ("SUCCESS".equals(response)) {
+                    System.out.println("\n✓ File transferred successfully and verified!");
+                } else if ("CHECKSUM_MISMATCH".equals(response)) {
+                    System.err.println("\n✗ Error: File corruption detected on server!");
+                    System.exit(1);
+                } else {
+                    System.err.println("\n✗ Unknown response from server: " + response);
+                }
+
+            } catch (Exception e) {
+                System.err.println("\n✗ Error: " + e.getMessage());
+                e.printStackTrace();
                 System.exit(1);
-            } else {
-                System.err.println("\n✗ Unknown response from server: " + response);
             }
-
         } catch (Exception e) {
-            System.err.println("\n✗ Error: " + e.getMessage());
+            System.err.println("\n✗ Error connecting: " + e.getMessage());
             e.printStackTrace();
             System.exit(1);
         }
@@ -186,5 +230,32 @@ public class Client {
         if (size < 1024 * 1024 * 1024)
             return String.format("%.2f MB", size / (1024.0 * 1024));
         return String.format("%.2f GB", size / (1024.0 * 1024 * 1024));
+    }
+
+    private static Socket createSSLSocket(String host, int port, String truststorePath, String truststorePassword)
+            throws Exception {
+        // Load truststore
+        KeyStore trustStore = KeyStore.getInstance("JKS");
+        try (FileInputStream trustStoreFile = new FileInputStream(truststorePath)) {
+            trustStore.load(trustStoreFile, truststorePassword.toCharArray());
+        }
+
+        // Initialize trust manager factory
+        TrustManagerFactory trustManagerFactory = TrustManagerFactory.getInstance(
+                TrustManagerFactory.getDefaultAlgorithm());
+        trustManagerFactory.init(trustStore);
+
+        // Initialize SSL context
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(null, trustManagerFactory.getTrustManagers(), null);
+
+        // Create SSL socket
+        SSLSocketFactory sslSocketFactory = sslContext.getSocketFactory();
+        SSLSocket sslSocket = (SSLSocket) sslSocketFactory.createSocket(host, port);
+
+        // Start SSL handshake
+        sslSocket.startHandshake();
+
+        return sslSocket;
     }
 }

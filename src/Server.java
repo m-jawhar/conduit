@@ -8,9 +8,15 @@ import java.io.IOException;
 import java.net.ServerSocket;
 import java.net.Socket;
 import java.security.DigestInputStream;
+import java.security.KeyStore;
 import java.security.MessageDigest;
 import java.util.concurrent.ExecutorService;
 import java.util.concurrent.Executors;
+
+import javax.net.ssl.KeyManagerFactory;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLServerSocket;
+import javax.net.ssl.SSLServerSocketFactory;
 
 public class Server {
 
@@ -22,35 +28,60 @@ public class Server {
     public static void main(String[] args) {
         int port = DEFAULT_PORT;
         String outputDir = DEFAULT_OUTPUT_DIR;
+        boolean useSSL = false;
+        String keystorePath = null;
+        String keystorePassword = null;
 
         // Parse command-line arguments
-        if (args.length > 0) {
-            try {
-                port = Integer.parseInt(args[0]);
-            } catch (NumberFormatException e) {
-                System.err.println("Invalid port number. Using default: " + DEFAULT_PORT);
-                port = DEFAULT_PORT;
-            }
-        }
-        if (args.length > 1) {
-            outputDir = args[1];
-            File dir = new File(outputDir);
-            if (!dir.exists()) {
-                if (!dir.mkdirs()) {
-                    System.err.println("Failed to create output directory. Using current directory.");
-                    outputDir = DEFAULT_OUTPUT_DIR;
+        int i = 0;
+        while (i < args.length) {
+            if ("--ssl".equals(args[i]) && i + 2 < args.length) {
+                useSSL = true;
+                keystorePath = args[i + 1];
+                keystorePassword = args[i + 2];
+                i += 3;
+            } else if (i == 0) {
+                try {
+                    port = Integer.parseInt(args[i]);
+                } catch (NumberFormatException e) {
+                    System.err.println("Invalid port number. Using default: " + DEFAULT_PORT);
+                    port = DEFAULT_PORT;
                 }
+                i++;
+            } else if (i == 1) {
+                outputDir = args[i];
+                File dir = new File(outputDir);
+                if (!dir.exists()) {
+                    if (!dir.mkdirs()) {
+                        System.err.println("Failed to create output directory. Using current directory.");
+                        outputDir = DEFAULT_OUTPUT_DIR;
+                    }
+                }
+                i++;
+            } else {
+                i++;
             }
         }
 
-        System.out.println("Usage: java Server [port] [output_directory]");
+        System.out.println("Usage: java Server [port] [output_directory] [--ssl keystore_path keystore_password]");
         System.out.println("Server starting on port " + port);
+        System.out.println("SSL/TLS: " + (useSSL ? "Enabled" : "Disabled"));
         System.out.println("Files will be saved to: " + new File(outputDir).getAbsolutePath());
 
         ExecutorService threadPool = Executors.newFixedThreadPool(MAX_THREADS);
         final String finalOutputDir = outputDir;
 
-        try (ServerSocket serverSocket = new ServerSocket(port)) {
+        try {
+            ServerSocket serverSocket;
+
+            if (useSSL) {
+                serverSocket = createSSLServerSocket(port, keystorePath, keystorePassword);
+                System.out.println("\u2713 SSL/TLS encryption enabled");
+            } else {
+                serverSocket = new ServerSocket(port);
+                System.out.println("\u26a0 WARNING: Running in plain-text mode (no encryption)");
+            }
+
             System.out.println("Server is ready. Waiting for connections...");
 
             while (true) {
@@ -70,6 +101,33 @@ public class Server {
         } finally {
             threadPool.shutdown();
         }
+    }
+
+    private static ServerSocket createSSLServerSocket(int port, String keystorePath, String keystorePassword)
+            throws Exception {
+        // Load keystore
+        KeyStore keyStore = KeyStore.getInstance("JKS");
+        try (FileInputStream keyStoreFile = new FileInputStream(keystorePath)) {
+            keyStore.load(keyStoreFile, keystorePassword.toCharArray());
+        }
+
+        // Initialize key manager factory
+        KeyManagerFactory keyManagerFactory = KeyManagerFactory.getInstance(
+                KeyManagerFactory.getDefaultAlgorithm());
+        keyManagerFactory.init(keyStore, keystorePassword.toCharArray());
+
+        // Initialize SSL context
+        SSLContext sslContext = SSLContext.getInstance("TLS");
+        sslContext.init(keyManagerFactory.getKeyManagers(), null, null);
+
+        // Create SSL server socket
+        SSLServerSocketFactory sslServerSocketFactory = sslContext.getServerSocketFactory();
+        SSLServerSocket sslServerSocket = (SSLServerSocket) sslServerSocketFactory.createServerSocket(port);
+
+        // Enable all supported cipher suites for better compatibility
+        sslServerSocket.setEnabledCipherSuites(sslServerSocket.getSupportedCipherSuites());
+
+        return sslServerSocket;
     }
 
     static class ClientHandler implements Runnable {
